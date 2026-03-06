@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GestureSphere · MediaPipe HandScale</title>
+    <!-- Tailwind for futuristic styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- MediaPipe Hands library (CDN) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <style>
+        /* custom glow & smooth scaling */
+        .glowing-circle {
+            width: 200px;
+            height: 200px;
+            background: radial-gradient(circle at 30% 30%, #00aaff, #0066cc);
+            box-shadow: 0 0 40px #00aaff, 0 0 80px #004488, 0 0 120px #002244;
+            border-radius: 9999px;
+            transition: box-shadow 0.2s ease;
+            will-change: transform;
+        }
+        /* subtle overlay for futuristic scanlines (optional) */
+        .scan-overlay {
+            background: repeating-linear-gradient(0deg, rgba(0,255,255,0.02) 0px, rgba(0,0,0,0.5) 2px, transparent 3px);
+            pointer-events: none;
+        }
+        /* tiny hidden video hack: video is visible but tiny & low opacity, still works for MediaPipe */
+        #webcam-preview {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            width: 160px;
+            height: 120px;
+            object-fit: cover;
+            border-radius: 16px;
+            opacity: 0.3;
+            border: 1px solid #00aaff55;
+            box-shadow: 0 0 20px #00aaff22;
+            transform: scaleX(-1); /* mirror for natural feel */
+            z-index: 50;
+            pointer-events: none;
+            transition: opacity 0.3s;
+        }
+        #webcam-preview:hover {
+            opacity: 0.8; /* optional: reveal on hover */
+        }
+    </style>
+</head>
+<body class="relative bg-black text-white font-sans overflow-hidden">
+
+    <!-- Dark futuristic gradient background -->
+    <div class="absolute inset-0 bg-gradient-to-br from-gray-950 via-blue-950/30 to-black scan-overlay"></div>
+    
+    <!-- Main content: centered circle + status -->
+    <div class="relative z-10 flex flex-col items-center justify-center min-h-screen px-4">
+        <!-- Status indicator (glass pill) -->
+        <div class="mb-12 flex items-center gap-3 px-5 py-2 rounded-full backdrop-blur-md bg-white/5 border border-cyan-500/30 shadow-[0_0_15px_#00aaff33]">
+            <span id="hand-status" class="text-sm uppercase tracking-wider font-light text-cyan-200/90">No Hand Detected</span>
+            <span id="status-dot" class="relative flex h-3 w-3">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-3 w-3 bg-cyan-500"></span>
+            </span>
+        </div>
+
+        <!-- Glowing circle (target for scaling) -->
+        <div id="scale-circle" class="glowing-circle"></div>
+
+        <!-- Optional tiny scale readout (futuristic) -->
+        <div class="mt-8 font-mono text-sm bg-black/40 backdrop-blur-sm px-4 py-2 rounded-full border border-cyan-500/30 text-cyan-300 shadow-lg">
+            scale: <span id="scale-readout">1.00</span>x
+        </div>
+
+        <!-- tiny caption for gesture hint -->
+        <p class="absolute bottom-24 left-1/2 -translate-x-1/2 text-[0.6rem] text-cyan-500/40 tracking-widest uppercase whitespace-nowrap">
+            ✦ pinch thumb & index to scale ✦
+        </p>
+    </div>
+
+    <!-- Hidden webcam preview (required for MediaPipe, but we make it subtle) -->
+    <video id="webcam-preview" autoplay playsinline muted></video>
+
+    <script type="module">
+        // --------------------------------------------------------------
+        //  PURE VANILLA JS – GESTURE SCALING WITH MEDIAPIPE HANDS
+        //  (No frameworks, ready for Phase 2 AI integration)
+        // --------------------------------------------------------------
+
+        // ----- DOM elements -----
+        const videoElement = document.getElementById('webcam-preview');
+        const circleElement = document.getElementById('scale-circle');
+        const handStatusSpan = document.getElementById('hand-status');
+        const scaleReadout = document.getElementById('scale-readout');
+        const statusDot = document.getElementById('status-dot');
+
+        // ----- Scaling parameters -----
+        const MIN_SCALE = 0.5;
+        const MAX_SCALE = 2.5;
+        // distance mapping: typical distance between thumb tip (4) and index tip (8) in pixels
+        // we map [minDist, maxDist] -> [MIN_SCALE, MAX_SCALE]
+        const MIN_DIST_PX = 30;    // ~ very close fingers
+        const MAX_DIST_PX = 200;   // ~ stretched fingers (relative to video size)
+        
+        // Smoothing (lerp factor)
+        const LERP_FACTOR = 0.15;   // between 0.05 and 0.2 for smooth follow
+
+        // ----- State -----
+        let targetScale = 1.0;
+        let currentScale = 1.0;
+        let lastHandDetected = false;
+        let animationFrame;
+
+        // ----- MediaPipe Hands setup -----
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        // Configure hands: one hand, high accuracy enough for 30fps
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,        // 0 or 1 (1 is more accurate but slower)
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        // Callback when results are ready
+        hands.onResults(onHandResults);
+
+        // ----- Webcam setup (native browser API) -----
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'user'
+                    }
+                });
+                videoElement.srcObject = stream;
+                await videoElement.play();
+
+                // Once video is playing, start the detection loop
+                videoElement.addEventListener('loadeddata', () => {
+                    // start sending frames to MediaPipe
+                    sendFrameToMediaPipe();
+                });
+            } catch (err) {
+                console.error('Camera access error:', err);
+                handStatusSpan.innerText = 'Camera Error';
+                handStatusSpan.classList.add('text-red-400');
+            }
+        }
+
+        // Continuously send video frames to MediaPipe
+        async function sendFrameToMediaPipe() {
+            if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+                await hands.send({ image: videoElement });
+            }
+            // schedule next frame (~30fps)
+            requestAnimationFrame(sendFrameToMediaPipe);
+        }
+
+        // ----- Process hand landmarks -----
+        function onHandResults(results) {
+            // default: no hand detected -> target scale gradually goes to 1.0
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                if (lastHandDetected) {
+                    handStatusSpan.innerText = 'No Hand Detected';
+                    lastHandDetected = false;
+                }
+                targetScale = 1.0; // return to neutral when no hand
+                return;
+            }
+
+            // hand detected
+            if (!lastHandDetected) {
+                handStatusSpan.innerText = 'Hand Detected';
+                lastHandDetected = true;
+            }
+
+            // get landmarks of first hand
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // MediaPipe landmarks: thumb tip = index 4, index finger tip = index 8
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+
+            // calculate Euclidean distance in normalized coordinates [0..1]
+            const dx = (thumbTip.x - indexTip.x) * videoElement.videoWidth;  // convert to pixels
+            const dy = (thumbTip.y - indexTip.y) * videoElement.videoHeight;
+            const distancePx = Math.sqrt(dx*dx + dy*dy);
+
+            // map distance to scale range (clamped)
+            let rawScale = 1.0;
+            if (distancePx <= MIN_DIST_PX) {
+                rawScale = MIN_SCALE;
+            } else if (distancePx >= MAX_DIST_PX) {
+                rawScale = MAX_SCALE;
+            } else {
+                // linear interpolation
+                const t = (distancePx - MIN_DIST_PX) / (MAX_DIST_PX - MIN_DIST_PX);
+                rawScale = MIN_SCALE + t * (MAX_SCALE - MIN_SCALE);
+            }
+
+            targetScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, rawScale));
+        }
+
+        // ----- Smooth animation loop (lerp + apply) -----
+        function animateScale() {
+            // linear interpolation toward target
+            currentScale += (targetScale - currentScale) * LERP_FACTOR;
+
+            // apply scale to circle
+            circleElement.style.transform = `scale(${currentScale})`;
+
+            // update readout
+            scaleReadout.innerText = currentScale.toFixed(2);
+
+            // continue loop
+            requestAnimationFrame(animateScale);
+        }
+
+        // ----- Start everything -----
+        initCamera();
+        animateScale();
+
+        // ----- Optional: clean up on page unload (good practice) -----
+        window.addEventListener('beforeunload', () => {
+            if (videoElement.srcObject) {
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+            }
+        });
+
+        // ----- Placeholder for future AI / MediaPipe integration (Phase 2) -----
+        // function getHandScaleValue() {
+        //     // future: replace distance logic with more robust palm-based normalization
+        //     return null;
+        // }
+
+        // ----- Simple error recovery if video fails -----
+        console.log('Gesture circle ready — show thumb & index finger to scale.');
+    </script>
+    <!-- Add a tiny note that this is Phase 1 prototype -->
+    <div class="absolute top-3 left-3 text-[0.6rem] text-cyan-500/30 font-mono z-50">✨ gesture prototype · phase 1</div>
+</body>
+</html>
